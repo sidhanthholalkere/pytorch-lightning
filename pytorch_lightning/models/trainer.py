@@ -495,10 +495,11 @@ If you want each process to load the full dataset, ignore this warning.
 """
             warnings.warn(msg)
 
-        if self.use_ddp and\
-                not all(isinstance(dataloader, DistributedSampler)
-                        for dataloader in self.val_dataloader):
-            msg = """
+        if self.val_dataloader is not None:
+            if self.use_ddp and\
+                    not all(isinstance(dataloader, DistributedSampler)
+                            for dataloader in self.val_dataloader):
+                msg = """
 You're val_dataloader(s) are not all DistributedSamplers.
 You're using multiple gpus and multiple nodes without using a DistributedSampler
 to assign a subset of your data to each process. To silence this warning, pass a
