@@ -33,29 +33,33 @@ class LightningModule(GradInformation, ModelIO, ModelHooks):
         """
         raise NotImplementedError
 
-    def validation_step(self, data_batch, batch_nb):
+    def training_step(self, *args, **kwargs):
         """
-        return whatever outputs will need to be aggregated in validation_end
-        :param data_batch:
+        return loss, dict with metrics for tqdm
+        :param called with batch, batch_nb
+        additional: optimizer_i if multiple optimizers used
         :return:
         """
         raise NotImplementedError
+
+    def validation_step(self, *args, **kwargs):
+        """
+        return whatever outputs will need to be aggregated in validation_end
+        OPTIONAL
+        :param called with batch, batch_nb
+        additional: dataset_i if multiple val datasets used
+        :return:
+        """
+        pass
 
     def validation_end(self, outputs):
         """
         Outputs has the appended output after each validation step
+        OPTIONAL
         :param outputs:
         :return: dic_with_metrics for tqdm
         """
-        raise NotImplementedError
-
-    def training_step(self, data_batch, batch_nb):
-        """
-        return loss, dict with metrics for tqdm
-        :param data_batch:
-        :return:
-        """
-        raise NotImplementedError
+        pass
 
     def configure_optimizers(self):
         """
@@ -64,10 +68,24 @@ class LightningModule(GradInformation, ModelIO, ModelHooks):
         """
         raise NotImplementedError
 
+    def optimizer_step(self, epoch_nb, batch_nb, optimizer, optimizer_i):
+        """
+        Do something instead of the standard optimizer behavior
+        :param epoch_nb:
+        :param batch_nb:
+        :param optimizer:
+        :param optimizer_i:
+        :return:
+        """
+        optimizer.step()
+
+        # clear gradients
+        optimizer.zero_grad()
+
     @data_loader
     def tng_dataloader(self):
         """
-        Implement a function to load an h5py of this data
+        Implement a PyTorch DataLoader
         :return:
         """
         raise NotImplementedError
@@ -75,18 +93,18 @@ class LightningModule(GradInformation, ModelIO, ModelHooks):
     @data_loader
     def test_dataloader(self):
         """
-        Implement a function to load an h5py of this data
+        Implement a PyTorch DataLoader
         :return:
         """
-        raise NotImplementedError
+        return None
 
     @data_loader
     def val_dataloader(self):
         """
-        Implement a function to load an h5py of this data
+        Implement a PyTorch DataLoader
         :return:
         """
-        raise NotImplementedError
+        return None
 
     @classmethod
     def load_from_metrics(cls, weights_path, tags_csv, on_gpu, map_location=None):

@@ -151,11 +151,12 @@ class LightningTestModel(LightningModule):
                 'test_dic': {'val_loss_a': loss_val}
             })
             return output
-        if batch_i % 4 == 0:
+        if batch_i % 5 == 0:
             output = OrderedDict({
-                f'val_loss{dataloader_i}' : loss_val,
-                f'val_acc{dataloader_i}' : val_acc,
+                f'val_loss_{dataloader_i}': loss_val,
+                f'val_acc_{dataloader_i}': val_acc,
             })
+            return output
 
     def validation_end(self, outputs):
         """
@@ -194,7 +195,7 @@ class LightningTestModel(LightningModule):
         optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
 
         # test returning only 1 list instead of 2
-        return [optimizer]
+        return optimizer
 
     def __dataloader(self, train):
         # init data generators
@@ -230,7 +231,7 @@ class LightningTestModel(LightningModule):
 
     @data_loader
     def val_dataloader(self):
-        return [self.__dataloader(train=False) for i in range(2)]
+        return [self.__dataloader(train=False), self.__dataloader(train=False)]
 
     @data_loader
     def test_dataloader(self):

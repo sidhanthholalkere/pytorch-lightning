@@ -12,7 +12,9 @@ import torch
 from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
 import torch.distributed as dist
+from torch.optim.optimizer import Optimizer
 
+from pytorch_lightning.root_module.root_module import LightningModule
 from pytorch_lightning.root_module.memory import get_gpu_memory_map
 from pytorch_lightning.root_module.model_saving import TrainerIO
 from pytorch_lightning.pt_overrides.override_data_parallel import (
@@ -312,10 +314,18 @@ class Trainer(TrainerIO):
         f_op = getattr(model, f_name, None)
         return callable(f_op)
 
+    def __is_overriden(self, f_name):
+        model = self.__get_model()
+        super_object = super(model.__class__, model)
+
+        # when code pointers are different, it was overriden
+        is_overriden = getattr(model, f_name).__code__ is not getattr(super_object, f_name).__code__
+        return is_overriden
+
     @property
     def __tng_tqdm_dic(self):
         tqdm_dic = {
-            'tng_loss': '{0:.3f}'.format(self.avg_loss),
+            'loss': '{0:.3f}'.format(self.avg_loss),
             'epoch': '{}'.format(self.current_epoch),
             'batch_nb': '{}'.format(self.batch_nb),
         }
@@ -345,17 +355,21 @@ class Trainer(TrainerIO):
         self.nb_tng_batches = int(self.nb_tng_batches * self.train_percent_check)
 
         # determine number of validation batches
-        self.nb_val_batches = sum(len(dataloader) for dataloader in self.val_dataloader)
+        # val datasets could be none, 1 or 2+
+        self.nb_val_batches = 0
+        if self.val_dataloader is not None:
+            self.nb_val_batches = sum(len(dataloader) for dataloader in self.val_dataloader)
+
         self.nb_val_batches = int(self.nb_val_batches * self.val_percent_check)
         self.nb_val_batches = max(1, self.nb_val_batches)
-        self.nb_val_batches = self.nb_val_batches
 
         # determine number of test batches
-        self.nb_test_batches = len(self.test_dataloader)
+        self.nb_test_batches = len(self.test_dataloader) if self.test_dataloader is not None else 0
         self.nb_test_batches = int(self.nb_test_batches * self.test_percent_check)
 
         # determine when to check validation
         self.val_check_batch = int(self.nb_tng_batches * self.val_check_interval)
+        self.val_check_batch = max(1, self.val_check_batch)
 
     def __add_tqdm_metrics(self, metrics):
         for k, v in metrics.items():
@@ -363,6 +377,31 @@ class Trainer(TrainerIO):
                 v = v.item()
 
             self.tqdm_metrics[k] = v
+
+    def __validation_forward(self, model, data_batch, batch_i, dataloader_i):
+        # make dataloader_i arg in validation_step optional
+        args = [data_batch, batch_i]
+        if len(self.val_dataloader) > 1:
+            args.append(dataloader_i)
+
+        if self.use_ddp:
+            output = model(*args)
+        elif self.use_dp:
+            output = model(*args)
+        elif self.single_gpu:
+            # put inputs on gpu manually
+            gpu_id = self.data_parallel_device_ids[0]
+            data_batch = self.transfer_batch_to_gpu(data_batch, gpu_id)
+            args[0] = data_batch
+
+            # do non dp, ddp step
+            output = model.validation_step(*args)
+
+        else:
+            # CPU
+            output = model.validation_step(*args)
+
+        return output
 
     def validate(self, model, dataloader, max_batches, dataloader_i):
         """
@@ -372,6 +411,7 @@ class Trainer(TrainerIO):
         :param max_batches: Scalar
         :return:
         """
+
         # enable eval mode
         model.zero_grad()
         model.eval()
@@ -395,34 +435,22 @@ class Trainer(TrainerIO):
             # -----------------
             # RUN VALIDATION STEP
             # -----------------
-            if self.use_ddp:
-                output = model(data_batch, batch_i)
-            elif self.use_dp:
-                output = model(data_batch, batch_i)
-            elif self.single_gpu:
-                # put inputs on gpu manually
-                gpu_id = self.data_parallel_device_ids[0]
-                for i, x in enumerate(data_batch):
-                    if isinstance(x, torch.Tensor):
-                        data_batch[i] = x.cuda(gpu_id)
+            output = self.__validation_forward(model, data_batch, batch_i, dataloader_i)
 
-                # do non dp, ddp step
-                output = model.validation_step(data_batch, batch_i, dataloader_i)
-
-            else:
-                output = model.validation_step(data_batch, batch_i, dataloader_i)
-
+            # track outputs for collation
             outputs.append(output)
 
             # batch done
             if self.progress_bar and self.prog_bar is not None:
                 self.prog_bar.update(1)
 
-        # give model a chance to do something with the outputs
-        if self.data_parallel:
-            val_results = model.module.validation_end(outputs)
-        else:
-            val_results = model.validation_end(outputs)
+        # give model a chance to do something with the outputs (and method defined)
+        val_results = {}
+        if self.__is_overriden('validation_end'):
+            if self.data_parallel:
+                val_results = model.module.validation_end(outputs)
+            else:
+                val_results = model.validation_end(outputs)
 
         # enable train mode again
         model.train()
@@ -439,8 +467,14 @@ class Trainer(TrainerIO):
         :return:
         """
         self.tng_dataloader = model.tng_dataloader
+
         self.test_dataloader = model.test_dataloader
         self.val_dataloader = model.val_dataloader if isinstance(model.val_dataloader, list) else [model.val_dataloader]
+
+        # handle returning an actual dataloader instead of a list of loaders
+        have_val_loaders = self.val_dataloader is not None
+        if have_val_loaders and not isinstance(self.val_dataloader, list):
+            self.val_dataloader = [self.val_dataloader]
 
         if self.use_ddp and not isinstance(self.tng_dataloader.sampler, DistributedSampler):
             msg = """
@@ -461,7 +495,9 @@ If you want each process to load the full dataset, ignore this warning.
 """
             warnings.warn(msg)
 
-        if self.use_ddp and not all(isinstance(dataloader, DistributedSampler) for dataloader in self.val_dataloader):
+        if self.use_ddp and\
+                not all(isinstance(dataloader, DistributedSampler)
+                        for dataloader in self.val_dataloader):
             msg = """
 You're val_dataloader(s) are not all DistributedSamplers.
 You're using multiple gpus and multiple nodes without using a DistributedSampler
@@ -497,12 +533,15 @@ If you want each process to load the full dataset, ignore this warning.
                 task = int(os.environ['SLURM_LOCALID'])
                 self.ddp_train(task, model)
             else:
-                msg = """
-You requested %(nb_gpus)s GPUs but launched %(nb_tasks)s slurm tasks.
-We will launch %(nb_gpus)s processes for you.
-We recommend you let slurm manage the processes by setting: --ntasks-per-node=%(nb_gpus)s
-If you're not using SLURM, ignore this message!
-""" % {'nb_gpus': self.nb_requested_gpus, 'nb_tasks': self.nb_slurm_tasks}
+                nb_gpus = self.nb_requested_gpus
+                nb_tasks = self.nb_slurm_tasks
+                msg = f"""
+                You requested {nb_gpus}s GPUs but launched {nb_tasks}s slurm tasks.
+                We will launch {nb_gpus}s processes for you.
+                We recommend you let slurm manage the processes by setting:
+                --ntasks-per-node={nb_gpus}s
+                If you're not using SLURM, ignore this message!
+                """
                 warnings.warn(msg)
                 mp.spawn(self.ddp_train, nprocs=len(self.data_parallel_device_ids), args=(model, ))
 
@@ -523,9 +562,7 @@ If you're not using SLURM, ignore this message!
 
             # CHOOSE OPTIMIZER
             # allow for lr schedulers as well
-            self.optimizers = model.configure_optimizers()
-            if len(self.optimizers) == 2:
-                self.optimizers, self.lr_schedulers = self.optimizers
+            self.optimizers, self.lr_schedulers = self.init_optimizers(model.configure_optimizers())
 
             self.__run_pretrain_routine(model)
 
@@ -533,12 +570,25 @@ If you're not using SLURM, ignore this message!
         # used for testing or when we need to know that training succeeded
         return 1
 
+    def init_optimizers(self, optimizers):
+
+        # single optimizer
+        if isinstance(optimizers, Optimizer):
+            return [optimizers], []
+
+        # two lists
+        elif len(optimizers) == 2 and isinstance(optimizers[0], list):
+            optimizers, lr_schedulers = optimizers
+            return optimizers, lr_schedulers
+
+        # single list or tuple
+        elif isinstance(optimizers, list) or isinstance(optimizers, tuple):
+            return optimizers, []
+
     def __single_gpu_train(self, model):
         # CHOOSE OPTIMIZER
         # allow for lr schedulers as well
-        self.optimizers = model.configure_optimizers()
-        if len(self.optimizers) == 2:
-            self.optimizers, self.lr_schedulers = self.optimizers
+        self.optimizers, self.lr_schedulers = self.init_optimizers(model.configure_optimizers())
 
         model.cuda(self.data_parallel_device_ids[0])
 
@@ -555,20 +605,18 @@ If you're not using SLURM, ignore this message!
 
         # CHOOSE OPTIMIZER
         # allow for lr schedulers as well
-        self.optimizers = model.configure_optimizers()
-        if len(self.optimizers) == 2:
-            self.optimizers, self.lr_schedulers = self.optimizers
+        self.optimizers, self.lr_schedulers = self.init_optimizers(model.configure_optimizers())
 
         model.cuda(self.data_parallel_device_ids[0])
 
         # check for this bug (amp + dp + !01 doesn't work)
         # https://github.com/NVIDIA/apex/issues/227
         if self.use_dp and self.use_amp:
-            m = """
-Amp level %r with DataParallel is not supported.
-See this note from NVIDIA for more info: https://github.com/NVIDIA/apex/issues/227.
-We recommend you switch to ddp if you want to use amp
-""" % self.amp_level
+            m = f"""
+            Amp level {self.amp_level} with DataParallel is not supported.
+            See this note from NVIDIA for more info: https://github.com/NVIDIA/apex/issues/227.
+            We recommend you switch to ddp if you want to use amp
+            """
             raise MisconfigurationException(m)
 
         model = LightningDataParallel(model, device_ids=self.data_parallel_device_ids)
@@ -615,9 +663,7 @@ We recommend you switch to ddp if you want to use amp
 
         # CHOOSE OPTIMIZER
         # allow for lr schedulers as well
-        self.optimizers = model.configure_optimizers()
-        if len(self.optimizers) == 2:
-            self.optimizers, self.lr_schedulers = self.optimizers
+        self.optimizers, self.lr_schedulers = self.init_optimizers(model.configure_optimizers())
 
         # MODEL
         # copy model to each gpu
@@ -725,32 +771,25 @@ We recommend you switch to ddp if you want to use amp
         if self.cluster is not None:  # pragma: no cover
             self.enable_auto_hpc_walltime_manager()
 
-        # run tiny validation to make sure program won't crash during val
+        # run tiny validation (if validation defined) to make sure program won't crash during val
         ref_model.on_sanity_check_start()
-        _ = [self.validate(model, dataloader, max_batches=self.nb_sanity_val_steps, dataloader_i=index) for index, dataloader in enumerate(self.val_dataloader)]
+        if self.val_dataloader is not None:
+            for ds_i, dataloader in enumerate(self.val_dataloader):
+                self.validate(model, dataloader, self.nb_sanity_val_steps, ds_i)
 
         # ---------------------------
         # CORE TRAINING LOOP
         # ---------------------------
-
         self.__train()
 
     def __train(self):
         # run all epochs
         for epoch_nb in range(self.current_epoch, self.max_nb_epochs):
-            # update the lr scheduler
-            if self.lr_schedulers is not None:
-                for lr_scheduler in self.lr_schedulers:
-                    lr_scheduler.step()
-
+            # get model
             model = self.__get_model()
+
+            # update training progress in trainer and model
             model.current_epoch = epoch_nb
-
-            # hook
-            if self.__is_function_implemented('on_epoch_start'):
-                model = self.__get_model()
-                model.on_epoch_start()
-
             self.current_epoch = epoch_nb
             self.total_batches = self.nb_tng_batches + self.nb_val_batches
             self.batch_loss_value = 0  # accumulated grads
@@ -760,91 +799,102 @@ We recommend you switch to ddp if you want to use amp
                 self.prog_bar = tqdm.tqdm(range(self.total_batches),
                                           position=self.process_position)
 
-            for batch_nb, data_batch in enumerate(self.tng_dataloader):
-                self.batch_nb = batch_nb
-                self.global_step += 1
+            # -----------------
+            # RUN TNG EPOCH
+            # -----------------
+            self.run_tng_epoch()
 
-                model = self.__get_model()
-                model.global_step = self.global_step
-
-                # stop when the flag is changed or we've gone past the amount
-                #  requested in the batches
-                self.total_batch_nb += 1
-                met_batch_limit = batch_nb > self.nb_tng_batches
-                if met_batch_limit:
-                    break
-
-                # ---------------
-                # RUN TRAIN STEP
-                # ---------------
-                batch_result = self.__run_tng_batch(data_batch, batch_nb)
-                early_stop_epoch = batch_result == -1
-
-                # ---------------
-                # RUN VAL STEP
-                # ---------------
-                is_val_check_batch = (batch_nb + 1) % self.val_check_batch == 0
-                if self.fast_dev_run or is_val_check_batch or early_stop_epoch:
-                    self.__run_validation()
-
-                # when batch should be saved
-                if (batch_nb + 1) % self.log_save_interval == 0 or early_stop_epoch:
-                    if self.proc_rank == 0 and self.experiment is not None:
-                        self.experiment.save()
-
-                # when metrics should be logged
-                if batch_nb % self.add_log_row_interval == 0 or early_stop_epoch:
-                    # count items in memory
-                    # nb_params, nb_tensors = count_mem_items()
-
-                    model = self.__get_model()
-                    metrics = self.__tng_tqdm_dic
-
-                    # add gpu memory
-                    if self.on_gpu:
-                        mem_map = get_gpu_memory_map()
-                        metrics.update(mem_map)
-
-                    # add norms
-                    if self.track_grad_norm > 0:
-                        model = self.__get_model()
-                        grad_norm_dic = model.grad_norm(self.track_grad_norm)
-                        metrics.update(grad_norm_dic)
-
-                    if self.__is_function_implemented('on_tng_metrics'):
-                        model.on_tng_metrics(metrics)
-
-                    # log metrics
-                    scalar_metrics = self.__metrics_to_scalars(
-                        metrics, blacklist=self.__log_vals_blacklist())
-                    if self.proc_rank == 0 and self.experiment is not None:
-                        self.experiment.log(scalar_metrics, global_step=self.global_step)
-                        self.experiment.save()
-
-                # hook
-                if self.__is_function_implemented('on_batch_end'):
-                    model = self.__get_model()
-                    model.on_batch_end()
-
-                # end epoch early
-                if early_stop_epoch:
-                    break
-
-            # hook
-            if self.__is_function_implemented('on_epoch_end'):
-                model = self.__get_model()
-                model.on_epoch_end()
+            # update LR schedulers
+            if self.lr_schedulers is not None:
+                for lr_scheduler in self.lr_schedulers:
+                    lr_scheduler.step()
 
             # early stopping
             met_min_epochs = epoch_nb > self.min_nb_epochs
             if self.enable_early_stop and met_min_epochs:
                 should_stop = self.early_stop_callback.on_epoch_end(epoch=epoch_nb,
                                                                     logs=self.__tng_tqdm_dic)
-
                 # stop training
                 stop = should_stop and met_min_epochs
                 if stop:
                     return
+
+    def run_tng_epoch(self):
+        # before epoch hook
+        if self.__is_function_implemented('on_epoch_start'):
+            model = self.__get_model()
+            model.on_epoch_start()
+
+        # run epoch
+        for batch_nb, data_batch in enumerate(self.tng_dataloader):
+            self.batch_nb = batch_nb
+            self.global_step += 1
+
+            model = self.__get_model()
+            model.global_step = self.global_step
+
+            # stop when the flag is changed or we've gone past the amount
+            #  requested in the batches
+            self.total_batch_nb += 1
+            met_batch_limit = batch_nb > self.nb_tng_batches
+            if met_batch_limit:
+                break
+
+            # ---------------
+            # RUN TRAIN STEP
+            # ---------------
+            batch_result = self.__run_tng_batch(data_batch, batch_nb)
+            early_stop_epoch = batch_result == -1
+
+            # ---------------
+            # RUN VAL STEP
+            # ---------------
+            is_val_check_batch = (batch_nb + 1) % self.val_check_batch == 0
+            if self.fast_dev_run or is_val_check_batch or early_stop_epoch:
+                self.__run_validation()
+
+            # when batch should be saved
+            if (batch_nb + 1) % self.log_save_interval == 0 or early_stop_epoch:
+                if self.proc_rank == 0 and self.experiment is not None:
+                    self.experiment.save()
+
+            # when metrics should be logged
+            if batch_nb % self.add_log_row_interval == 0 or early_stop_epoch:
+                # count items in memory
+                # nb_params, nb_tensors = count_mem_items()
+
+                model = self.__get_model()
+                metrics = self.__tng_tqdm_dic
+
+                # add gpu memory
+                if self.on_gpu:
+                    mem_map = get_gpu_memory_map()
+                    metrics.update(mem_map)
+
+                # add norms
+                if self.track_grad_norm > 0:
+                    model = self.__get_model()
+                    grad_norm_dic = model.grad_norm(self.track_grad_norm)
+                    metrics.update(grad_norm_dic)
+
+                if self.__is_function_implemented('on_tng_metrics'):
+                    model.on_tng_metrics(metrics)
+
+                # log metrics
+                scalar_metrics = self.__metrics_to_scalars(
+                    metrics, blacklist=self.__log_vals_blacklist())
+                if self.proc_rank == 0 and self.experiment is not None:
+                    self.experiment.log(scalar_metrics, global_step=self.global_step)
+                    self.experiment.save()
+
+            # end epoch early
+            if early_stop_epoch:
+                break
+
+        # epoch end hook
+        if self.__is_function_implemented('on_epoch_end'):
+            model = self.__get_model()
+            model.on_epoch_end()
 
     def __metrics_to_scalars(self, metrics, blacklist=set()):
         new_metrics = {}
@@ -865,6 +915,95 @@ We recommend you switch to ddp if you want to use amp
         blacklist = {'batch_nb', 'v_nb', 'gpu'}
         return blacklist
 
+    def transfer_batch_to_gpu(self, batch, gpu_id):
+        # base case
+        if isinstance(batch, torch.Tensor):
+            return batch.cuda(gpu_id)
+
+        # when list
+        elif isinstance(batch, list):
+            for i, x in enumerate(batch):
+                batch[i] = self.transfer_batch_to_gpu(x, gpu_id)
+            return batch
+
+        # when dict
+        elif isinstance(batch, dict):
+            for k, v in batch.items():
+                batch[k] = self.transfer_batch_to_gpu(v, gpu_id)
+
+            return batch
+
+    def __tng_forward(self, data_batch, batch_nb, opt_idx):
+        """
+        Handle forward for each training case (distributed, single gpu, etc...)
+        :param data_batch:
+        :param batch_nb:
+        :return:
+        """
+        # ---------------
+        # FORWARD
+        # ---------------
+        # enable not needing to add opt_idx to training_step
+        args = [data_batch, batch_nb]
+        if len(self.optimizers) > 1:
+            args.append(opt_idx)
+
+        if self.use_ddp:
+            output = self.model(*args)
+        elif self.use_dp:
+            output = self.model(*args)
+        elif self.single_gpu:
+            gpu_id = self.data_parallel_device_ids[0]
+            data_batch = self.transfer_batch_to_gpu(data_batch, gpu_id)
+            args[0] = data_batch
+            output = self.model.training_step(*args)
+
+        else:
+            output = self.model.training_step(*args)
+
+        # ---------------
+        # TQDM metrics
+        # ---------------
+        try:
+            prog_output = output['prog']
+
+            # reduce prog metrics for tqdm when using dp
+            if self.use_dp:
+                nb_gpus = len(self.data_parallel_device_ids)
+                prog_output = reduce_distributed_output(prog_output, nb_gpus)
+
+            model_specific_tqdm_metrics_dic = prog_output
+        except Exception:
+            model_specific_tqdm_metrics_dic = {}
+
+        # ---------------
+        # EXTRACT LOSS
+        # ---------------
+        # if output dict doesn't have the keyword loss
+        # then assume the output=loss if scalar
+        try:
+            loss = output['loss']
+        except Exception:
+            if type(output) is torch.Tensor:
+                loss = output
+
+        # when using dp need to reduce the loss
+        if self.use_dp:
+            loss = reduce_distributed_output(loss, len(self.data_parallel_device_ids))
+
+        return loss, model_specific_tqdm_metrics_dic
+
+    def __clip_gradients(self):
+        if self.gradient_clip > 0:
+            model = self.__get_model()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), self.gradient_clip)
+
+    def __print_nan_grads(self):
+        if self.print_nan_grads:
+            model = self.__get_model()
+            for param in model.parameters():
+                print(param.grad.float().sum())
+
     def __run_tng_batch(self, data_batch, batch_nb):
         if data_batch is None:
             return 0
@@ -880,102 +1019,57 @@ We recommend you switch to ddp if you want to use amp
         if self.progress_bar:
             self.prog_bar.update(1)
 
-        # forward pass
-        # return a scalar value and a dic with tqdm metrics
-        if self.use_ddp:
-            output = self.model(data_batch, batch_nb)
-        elif self.use_dp:
-            output = self.model(data_batch, batch_nb)
-        elif self.single_gpu:
-            gpu_id = self.data_parallel_device_ids[0]
-            for i, x in enumerate(data_batch):
-                if isinstance(x, torch.Tensor):
-                    data_batch[i] = x.cuda(gpu_id)
-            output = self.model.training_step(data_batch, batch_nb)
+        # call training_step once per optimizer
+        for opt_idx, optimizer in enumerate(self.optimizers):
 
-        else:
-            output = self.model.training_step(data_batch, batch_nb)
+            # forward pass
+            loss, model_specific_tqdm_metrics = self.__tng_forward(data_batch, batch_nb, opt_idx)
 
-        try:
-            prog_output = output['prog']
+            # track metrics
+            self.__add_tqdm_metrics(model_specific_tqdm_metrics)
 
-            # reduce prog metrics for tqdm when using dp
-            if self.use_dp:
-                nb_gpus = len(self.data_parallel_device_ids)
-                prog_output = reduce_distributed_output(prog_output, nb_gpus)
+            # accumulate loss
+            # (if accumulate_grad_batches = 1 no effect)
+            loss = loss / self.accumulate_grad_batches
 
-            model_specific_tqdm_metrics_dic = prog_output
-        except Exception:
-            model_specific_tqdm_metrics_dic = {}
-
-        # if output dict doesn't have the keyword loss
-        # then assume the output=loss if scalar
-        try:
-            loss = output['loss']
-        except Exception:
-            if type(output) is torch.Tensor:
-                loss = output
-
-        # when using dp need to reduce the loss
-        if self.use_dp:
-            loss = reduce_distributed_output(loss, len(self.data_parallel_device_ids))
-
-        self.__add_tqdm_metrics(model_specific_tqdm_metrics_dic)
-
-        # accumulate loss (if accumulate_grad_batches = 1 no effect)
-        loss = loss / self.accumulate_grad_batches
-
-        # backward pass
-        if self.use_amp:
-            # scale loss when using amp
-            for optimizer in self.optimizers:
+            # backward pass
+            if self.use_amp:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
-        else:
-            loss.backward()
+            else:
+                loss.backward()
 
-        # insert after step hook
-        if self.__is_function_implemented('on_after_backward'):
-            model_ref = self.__get_model()
-            response = model_ref.on_after_backward()
+            # insert after step hook
+            if self.__is_function_implemented('on_after_backward'):
+                model_ref = self.__get_model()
+                model_ref.on_after_backward()
 
-        if self.print_nan_grads:
-            model = self.__get_model()
-            for param in model.parameters():
-                print(param.grad.float().sum())
+            # nan grads
+            self.__print_nan_grads()
 
-        # track total loss for logging (avoid mem leaks)
-        self.batch_loss_value += loss.item()
+            # track total loss for logging (avoid mem leaks)
+            self.batch_loss_value += loss.item()
 
-        # gradient update with accumulated gradients
-        if (self.batch_nb + 1) % self.accumulate_grad_batches == 0:
-            # clip gradients
-            if self.gradient_clip > 0:
+            # gradient update with accumulated gradients
+            if (self.batch_nb + 1) % self.accumulate_grad_batches == 0:
+                # clip gradients
+                self.__clip_gradients()
+
+                # calls .step(), .zero_grad()
+                # override function to modify this behavior
                 model = self.__get_model()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), self.gradient_clip)
+                model.optimizer_step(self.current_epoch, batch_nb, optimizer, opt_idx)
 
-            # update gradients across all optimizers
-            for optimizer in self.optimizers:
-                optimizer.step()
+                # calculate running loss for display
+                self.running_loss.append(self.batch_loss_value)
+                self.batch_loss_value = 0
+                self.avg_loss = np.mean(self.running_loss[-100:])
 
-                # insert after step hook
-                if self.__is_function_implemented('on_before_zero_grad'):
-                    model_ref = self.__get_model()
-                    response = model_ref.on_before_zero_grad(optimizer)
-
-                # clear gradients
-                optimizer.zero_grad()
-
-            # calculate running loss for display
-            self.running_loss.append(self.batch_loss_value)
-            self.batch_loss_value = 0
-            self.avg_loss = np.mean(self.running_loss[-100:])
-
-            # update progbar
-            if self.progress_bar:
-                # add model specific metrics
-                tqdm_metrics = self.__tng_tqdm_dic
-                self.prog_bar.set_postfix(**tqdm_metrics)
+                # update progbar
+                if self.progress_bar:
+                    # add model specific metrics
+                    tqdm_metrics = self.__tng_tqdm_dic
+                    self.prog_bar.set_postfix(**tqdm_metrics)
 
         # activate batch end hook
         if self.__is_function_implemented('on_batch_end'):
@@ -992,31 +1086,30 @@ We recommend you switch to ddp if you want to use amp
         elif not can_check_epoch:
             return
 
-        # hook
-        if self.__is_function_implemented('on_pre_performance_check'):
-            model = self.__get_model()
-            model.on_pre_performance_check()
+        # validate only if model has validation_step defined
+        if self.__is_overriden('validation_step'):
 
-        # use full val set on end of epoch
-        # use a small portion otherwise
-        max_batches = None if not self.fast_dev_run else 1
-        validation_results = [self.validate(
-            self.model,
-            dataloader,
-            max_batches,
-            index
-        ) for index, dataloader in enumerate(self.val_dataloader)]
-        _ = [self.__add_tqdm_metrics(metric) for metric in validation_results]
+            # hook
+            if self.__is_function_implemented('on_pre_performance_check'):
+                model = self.__get_model()
+                model.on_pre_performance_check()
 
-        # hook
-        if self.__is_function_implemented('on_post_performance_check'):
-            model = self.__get_model()
-            model.on_post_performance_check()
+            # use val_percent_check set on end of epoch
+            # use a small portion otherwise
+            max_batches = self.nb_val_batches if not self.fast_dev_run else 1
+            for ds_i, dataloader in enumerate(self.val_dataloader):
+                val_out_metrics = self.validate(self.model, dataloader, max_batches, ds_i)
+                self.__add_tqdm_metrics(val_out_metrics)
 
-        if self.progress_bar:
-            # add model specific metrics
-            tqdm_metrics = self.__tng_tqdm_dic
-            self.prog_bar.set_postfix(**tqdm_metrics)
+            # hook
+            if self.__is_function_implemented('on_post_performance_check'):
+                model = self.__get_model()
+                model.on_post_performance_check()
+
+            if self.progress_bar:
+                # add model specific metrics
+                tqdm_metrics = self.__tng_tqdm_dic
+                self.prog_bar.set_postfix(**tqdm_metrics)
 
         # model checkpointing
         if self.proc_rank == 0 and self.checkpoint_callback is not None:

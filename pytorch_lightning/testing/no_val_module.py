@@ -1,40 +1,41 @@
-"""
-Example template for defining a system
-"""
 import os
 from collections import OrderedDict
-import torch.nn as nn
-from torchvision.datasets import MNIST
-import torchvision.transforms as transforms
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from test_tube import HyperOptArgumentParser
 from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torchvision.datasets import MNIST
+from torchvision import transforms
+from test_tube import HyperOptArgumentParser
 
-import pytorch_lightning as pl
 from pytorch_lightning.root_module.root_module import LightningModule
+from pytorch_lightning import data_loader
 
 
-class LightningTemplateModel(LightningModule):
+class NoValModel(LightningModule):
     """
     Sample model to show how to define a template
     """
 
-    def __init__(self, hparams):
+    def __init__(self, hparams, force_remove_distributed_sampler=False):
         """
         Pass in parsed HyperOptArgumentParser to the model
         :param hparams:
         """
         # init superclass
-        super(LightningTemplateModel, self).__init__()
+        super(NoValModel, self).__init__()
         self.hparams = hparams
 
         self.batch_size = hparams.batch_size
 
         # if you specify an example input, the summary will show input/output for each layer
         self.example_input_array = torch.rand(5, 28 * 28)
+
+        # remove to test warning for dist sampler
+        self.force_remove_distributed_sampler = force_remove_distributed_sampler
 
         # build model
         self.__build_model()
@@ -98,77 +99,18 @@ class LightningTemplateModel(LightningModule):
         if self.trainer.use_dp:
             loss_val = loss_val.unsqueeze(0)
 
-        output = OrderedDict({
-            'loss': loss_val
-        })
+        # alternate possible outputs to test
+        if self.trainer.batch_nb % 1 == 0:
+            output = OrderedDict({
+                'loss': loss_val,
+                'prog': {'some_val': loss_val * loss_val}
+            })
+            return output
+        if self.trainer.batch_nb % 2 == 0:
+            return loss_val
 
-        # can also return just a scalar instead of a dict (return loss_val)
-        return output
-
-    def validation_step(self, data_batch, batch_i):
-        """
-        Lightning calls this inside the validation loop
-        :param data_batch:
-        :return:
-        """
-        x, y = data_batch
-        x = x.view(x.size(0), -1)
-        y_hat = self.forward(x)
-
-        loss_val = self.loss(y, y_hat)
-
-        # acc
-        labels_hat = torch.argmax(y_hat, dim=1)
-        val_acc = torch.sum(y == labels_hat).item() / (len(y) * 1.0)
-        val_acc = torch.tensor(val_acc)
-
-        if self.on_gpu:
-            val_acc = val_acc.cuda(loss_val.device.index)
-
-        # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
-        if self.trainer.use_dp:
-            loss_val = loss_val.unsqueeze(0)
-            val_acc = val_acc.unsqueeze(0)
-
-        output = OrderedDict({
-            'val_loss': loss_val,
-            'val_acc': val_acc,
-        })
-
-        # can also return just a scalar instead of a dict (return loss_val)
-        return output
-
-    def validation_end(self, outputs):
-        """
-        Called at the end of validation to aggregate outputs
-        :param outputs: list of individual outputs of each validation step
-        :return:
-        """
-        # if returned a scalar from validation_step, outputs is a list of tensor scalars
-        # we return just the average in this case (if we want)
-        # return torch.stack(outputs).mean()
-
-        val_loss_mean = 0
-        val_acc_mean = 0
-        for output in outputs:
-            val_loss = output['val_loss']
-
-            # reduce manually when using dp
-            if self.trainer.use_dp:
-                val_loss = torch.mean(val_loss)
-            val_loss_mean += val_loss
-
-            # reduce manually when using dp
-            val_acc = output['val_acc']
-            if self.trainer.use_dp:
-                val_acc = torch.mean(val_acc)
-
-            val_acc_mean += val_acc
-
-        val_loss_mean /= len(outputs)
-        val_acc_mean /= len(outputs)
-        tqdm_dic = {'val_loss': val_loss_mean, 'val_acc': val_acc_mean}
-        return tqdm_dic
+    def on_tng_metrics(self, logs):
+        logs['some_tensor_to_test'] = torch.rand(1)
 
     # ---------------------
     # TRAINING SETUP
@@ -178,9 +120,11 @@ class LightningTemplateModel(LightningModule):
         return whatever optimizers we want here
         :return: list of optimizers
         """
+        # try no scheduler for this model (testing purposes)
         optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
-        return [optimizer], [scheduler]
+
+        # test returning only 1 list instead of 2
+        return [optimizer]
 
     def __dataloader(self, train):
         # init data generators
@@ -194,7 +138,7 @@ class LightningTemplateModel(LightningModule):
         batch_size = self.hparams.batch_size
 
         try:
-            if self.on_gpu:
+            if self.on_gpu and not self.force_remove_distributed_sampler:
                 train_sampler = DistributedSampler(dataset, rank=self.trainer.proc_rank)
                 batch_size = batch_size // self.trainer.world_size  # scale batch size
         except Exception:
@@ -210,20 +154,9 @@ class LightningTemplateModel(LightningModule):
 
         return loader
 
-    @pl.data_loader
+    @data_loader
     def tng_dataloader(self):
-        print('tng data loader called')
         return self.__dataloader(train=True)
-
-    @pl.data_loader
-    def val_dataloader(self):
-        print('val data loader called')
-        return self.__dataloader(train=False)
-
-    @pl.data_loader
-    def test_dataloader(self):
-        print('test data loader called')
-        return self.__dataloader(train=False)
 
     @staticmethod
     def add_model_specific_args(parent_parser, root_dir):  # pragma: no cover
@@ -239,11 +172,11 @@ class LightningTemplateModel(LightningModule):
         # parser.set_defaults(gradient_clip=5.0)
 
         # network params
+        parser.opt_list('--drop_prob', default=0.2, options=[0.2, 0.5], type=float, tunable=False)
         parser.add_argument('--in_features', default=28 * 28, type=int)
         parser.add_argument('--out_features', default=10, type=int)
         # use 500 for CPU, 50000 for GPU to see speed difference
         parser.add_argument('--hidden_dim', default=50000, type=int)
-        parser.opt_list('--drop_prob', default=0.2, options=[0.2, 0.5], type=float, tunable=False)
 
         # data
         parser.add_argument('--data_root', default=os.path.join(root_dir, 'mnist'), type=str)

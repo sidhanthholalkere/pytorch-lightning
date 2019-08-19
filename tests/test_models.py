@@ -10,7 +10,7 @@ from test_tube import Experiment, SlurmCluster
 
 # sys.path += [os.path.abspath('..'), os.path.abspath('../..')]
 from pytorch_lightning import Trainer
-from pytorch_lightning.testing.lm_test_module import LightningTestModel
+from pytorch_lightning.testing import LightningTestModel, NoValEndTestModel, NoValModel
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.utilities.debugging import MisconfigurationException
 from pytorch_lightning.root_module import memory
@@ -26,6 +26,188 @@ np.random.seed(SEED)
 # ------------------------------------------------------------------------
 # TESTS
 # ------------------------------------------------------------------------
+
+def test_optimizer_return_options():
+
+    trainer = Trainer()
+    model, hparams = get_model()
+
+    # single optimizer
+    opt_a = torch.optim.Adam(model.parameters(), lr=0.002)
+    opt_b = torch.optim.SGD(model.parameters(), lr=0.002)
+    optim, lr_sched = trainer.init_optimizers(opt_a)
+    assert len(optim) == 1 and len(lr_sched) == 0
+
+    # opt tuple
+    opts = (opt_a, opt_b)
+    optim, lr_sched = trainer.init_optimizers(opts)
+    assert len(optim) == 2 and optim[0] == opts[0] and optim[1] == opts[1]
+    assert len(lr_sched) == 0
+
+    # opt list
+    opts = [opt_a, opt_b]
+    optim, lr_sched = trainer.init_optimizers(opts)
+    assert len(optim) == 2 and optim[0] == opts[0] and optim[1] == opts[1]
+    assert len(lr_sched) == 0
+
+    # opt tuple of lists
+    opts = ([opt_a], ['lr_scheduler'])
+    optim, lr_sched = trainer.init_optimizers(opts)
+    assert len(optim) == 1 and len(lr_sched) == 1
+    assert optim[0] == opts[0][0] and lr_sched[0] == 'lr_scheduler'
+
+
+def test_single_gpu_batch_parse():
+    if not torch.cuda.is_available():
+        warnings.warn('test_amp_gpu_ddp cannot run.'
+                      'Rerun on a GPU node to run this test')
+        return
+    if not torch.cuda.device_count() > 1:
+        warnings.warn('test_amp_gpu_ddp cannot run.'
+                      'Rerun on a node with 2+ GPUs to run this test')
+        return
+
+    trainer = Trainer()
+
+    # batch is just a tensor
+    batch = torch.rand(2, 3)
+    batch = trainer.transfer_batch_to_gpu(batch, 0)
+    assert batch.device.index == 0 and batch.type() == 'torch.cuda.FloatTensor'
+
+    # tensor list
+    batch = [torch.rand(2, 3), torch.rand(2, 3)]
+    batch = trainer.transfer_batch_to_gpu(batch, 0)
+    assert batch[0].device.index == 0 and batch[0].type() == 'torch.cuda.FloatTensor'
+    assert batch[1].device.index == 0 and batch[1].type() == 'torch.cuda.FloatTensor'
+
+    # tensor list of lists
+    batch = [[torch.rand(2, 3), torch.rand(2, 3)]]
+    batch = trainer.transfer_batch_to_gpu(batch, 0)
+    assert batch[0][0].device.index == 0 and batch[0][0].type() == 'torch.cuda.FloatTensor'
+    assert batch[0][1].device.index == 0 and batch[0][1].type() == 'torch.cuda.FloatTensor'
+
+    # tensor dict
+    batch = [{'a': torch.rand(2, 3), 'b': torch.rand(2, 3)}]
+    batch = trainer.transfer_batch_to_gpu(batch, 0)
+    assert batch[0]['a'].device.index == 0 and batch[0]['a'].type() == 'torch.cuda.FloatTensor'
+    assert batch[0]['b'].device.index == 0 and batch[0]['b'].type() == 'torch.cuda.FloatTensor'
+
+
+def test_early_stopping_cpu_model():
+    """
+    Test each of the trainer options
+    :return:
+    """
+
+    stopping = EarlyStopping(monitor='val_loss')
+    trainer_options = dict(
+        early_stop_callback=stopping,
+        gradient_clip=1.0,
+        overfit_pct=0.20,
+        track_grad_norm=2,
+        print_nan_grads=True,
+        progress_bar=False,
+        experiment=get_exp(),
+        train_percent_check=0.1,
+        val_percent_check=0.1
+    )
+
+    model, hparams = get_model()
+    run_gpu_model_test(trainer_options, model, hparams, on_gpu=False)
+
+    # test freeze on cpu
+    model.freeze()
+    model.unfreeze()
+
+
+def test_no_val_module():
+    """
+    Tests use case where trainer saves the model, and user loads it from tags independently
+    :return:
+    """
+    hparams = get_hparams()
+    model = NoValModel(hparams)
+
+    save_dir = init_save_dir()
+
+    # exp file to get meta
+    exp = get_exp(False)
+    exp.argparse(hparams)
+    exp.save()
+
+    trainer_options = dict(
+        max_nb_epochs=1,
+        cluster=SlurmCluster(),
+        experiment=exp,
+        checkpoint_callback=ModelCheckpoint(save_dir)
+    )
+
+    # fit model
+    trainer = Trainer(**trainer_options)
+    result = trainer.fit(model)
+
+    # traning complete
+    assert result == 1, 'amp + ddp model failed to complete'
+
+    # save model
+    new_weights_path = os.path.join(save_dir, 'save_test.ckpt')
+    trainer.save_checkpoint(new_weights_path)
+
+    # load new model
+    tags_path = exp.get_data_path(exp.name, exp.version)
+    tags_path = os.path.join(tags_path, 'meta_tags.csv')
+    model_2 = LightningTestModel.load_from_metrics(weights_path=new_weights_path,
+                                                   tags_csv=tags_path, on_gpu=False)
+    model_2.eval()
+
+    # make prediction
+    clear_save_dir()
+
+
+def test_no_val_end_module():
+    """
+    Tests use case where trainer saves the model, and user loads it from tags independently
+    :return:
+    """
+    hparams = get_hparams()
+    model = NoValEndTestModel(hparams)
+
+    save_dir = init_save_dir()
+
+    # exp file to get meta
+    exp = get_exp(False)
+    exp.argparse(hparams)
+    exp.save()
+
+    trainer_options = dict(
+        max_nb_epochs=1,
+        cluster=SlurmCluster(),
+        experiment=exp,
+        checkpoint_callback=ModelCheckpoint(save_dir)
+    )
+
+    # fit model
+    trainer = Trainer(**trainer_options)
+    result = trainer.fit(model)
+
+    # traning complete
+    assert result == 1, 'amp + ddp model failed to complete'
+
+    # save model
+    new_weights_path = os.path.join(save_dir, 'save_test.ckpt')
+    trainer.save_checkpoint(new_weights_path)
+
+    # load new model
+    tags_path = exp.get_data_path(exp.name, exp.version)
+    tags_path = os.path.join(tags_path, 'meta_tags.csv')
+    model_2 = LightningTestModel.load_from_metrics(weights_path=new_weights_path,
+                                                   tags_csv=tags_path, on_gpu=False)
+    model_2.eval()
+
+    # make prediction
+    clear_save_dir()
+
+
 def test_simple_cpu():
     """
     Verify continue training session on CPU
@@ -136,7 +318,7 @@ def test_cpu_restore_training():
         # if model and state loaded correctly, predictions will be good even though we
         # haven't trained with the new loaded model
         trainer.model.eval()
-        run_prediction(trainer.val_dataloader, trainer.model)
+        _ = [run_prediction(dataloader, trainer.model) for dataloader in trainer.val_dataloader]
 
     model.on_sanity_check_start = assert_good_acc
 
@@ -445,33 +627,6 @@ def test_amp_gpu_ddp_slurm_managed():
     clear_save_dir()
 
 
-def test_early_stopping_cpu_model():
-    """
-    Test each of the trainer options
-    :return:
-    """
-
-    stopping = EarlyStopping()
-    trainer_options = dict(
-        early_stop_callback=stopping,
-        gradient_clip=1.0,
-        overfit_pct=0.20,
-        track_grad_norm=2,
-        print_nan_grads=True,
-        progress_bar=False,
-        experiment=get_exp(),
-        train_percent_check=0.1,
-        val_percent_check=0.1
-    )
-
-    model, hparams = get_model()
-    run_gpu_model_test(trainer_options, model, hparams, on_gpu=False)
-
-    # test freeze on cpu
-    model.freeze()
-    model.unfreeze()
-
-
 def test_cpu_model_with_amp():
     """
     Make sure model trains on CPU
@@ -525,6 +680,7 @@ def test_all_features_cpu_model():
         print_nan_grads=True,
         progress_bar=False,
         experiment=get_exp(),
+        accumulate_grad_batches=2,
         max_nb_epochs=1,
         train_percent_check=0.4,
         val_percent_check=0.4
@@ -690,10 +846,16 @@ def test_multiple_val_dataloader():
 
     # fit model
     trainer = Trainer(**trainer_options)
-    _ = trainer.fit(model)
+    result = trainer.fit(model)
 
-    # traning complete
+    # verify tng completed
+    assert result == 1
+
+    # verify there are 2 val loaders
     assert len(trainer.val_dataloader) == 2, 'Multiple val_dataloaders not initiated properly'
+
+    # make sure predictions are good for each val set
+    [run_prediction(dataloader, trainer.model) for dataloader in trainer.val_dataloader]
 
 
 # ------------------------------------------------------------------------
