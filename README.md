@@ -33,15 +33,15 @@ pip install pytorch-lightning
 **[View the docs here](https://williamfalcon.github.io/pytorch-lightning/)**
 
 ## What is it?  
-Lightning is a very lightweight wrapper on PyTorch. This means you don't have to learn a new library. It defers core training and validation logic to you and automates the rest. It guarantees tested, correct, modern best practices for the automated parts.
+Lightning is a very lightweight wrapper on PyTorch. This means you don't have to learn a new library. To use Lightning, simply refactor your research code into the [LightningModule](https://github.com/williamFalcon/pytorch-lightning#how-do-i-do-use-it) format and Lightning will automate the rest. Lightning guarantees tested, correct, modern best practices for the automated parts.
 
+## Starting a new project?   
+[Use our seed-project aimed at reproducibility!](https://github.com/williamFalcon/pytorch-lightning-conference-seed)     
 
 ## Why do I want to use lightning?
-When starting a new project the last thing you want to do is recode a training loop, multi-cluster training, 16-bit precision, early-stopping, model loading/saving, when to validate, etc... You're likely to spend a long time ironing out all the bugs without even getting to the core of your research.
+Every research project starts the same, a model, a training loop, validation loop, etc. As your research advances, you're likely to need distributed training, 16-bit precision, checkpointing, gradient accumulation, etc.   
 
-With lightning, you guarantee those parts of your code work so you can focus on the meat of the research: The data and the training/validation loop logic. 
-
-Don't worry about training on multiple gpus or speeding up your code, lightning will do that for you!
+Lightning sets up all the boilerplate state-of-the-art training for you so you can focus on the research.   
 
 ---   
 ## README Table of Contents        
@@ -59,9 +59,9 @@ Don't worry about training on multiple gpus or speeding up your code, lightning 
 
 ---   
 ## How do I do use it?   
-The research code goes into a [LightningModule]((https://williamfalcon.github.io/pytorch-lightning/LightningModule/RequiredTrainerInterface/)) which you fit using a Trainer.    
+Think about Lightning as refactoring your research code instead of using a new framework. The research code goes into a [LightningModule]((https://williamfalcon.github.io/pytorch-lightning/LightningModule/RequiredTrainerInterface/)) which you fit using a Trainer.    
 
-Think of the LightningModule as a *system* such as seq-2-seq, GAN, etc... However, the LightningModule can ALSO just be a simple classifier such as the example below.     
+The LightningModule defines a *system* such as seq-2-seq, GAN, etc... It can ALSO define a simple classifier such as the example below.     
 
 To use lightning do 2 things:  
 1. [Define a LightningModule](https://williamfalcon.github.io/pytorch-lightning/LightningModule/RequiredTrainerInterface/)         
@@ -166,7 +166,7 @@ You define the blue parts using the LightningModule interface:
 
 ![Ouverview](./docs/source/_static/overview_flat.jpg)
 
-```{.python}
+```python
 # what to do in the training loop
 def training_step(self, data_batch, batch_nb):
 
@@ -253,7 +253,7 @@ Lightning also adds a text column with all the hyperparameters for this experime
 ![tensorboard-support](./docs/source/_static/tf_tags.png)
 
 Simply note the path you set for the Experiment    
-``` {.python}   
+```python
 from test_tube import Experiment
 from pytorch-lightning import  Trainer
 
@@ -362,7 +362,16 @@ python multi_node_cluster_template.py --nb_gpu_nodes 4 --gpus '0,1,2,3,4,5,6,7'
 
 ---    
 ## Asking for help    
-Welcome to the Lightning community! To chat with the rest of us visit our [gitter channel](https://gitter.im/PyTorch-Lightning/community?utm_source=share-link&utm_medium=link&utm_campaign=share-link)!
+Welcome to the Lightning community!   
+
+If you have any questions, feel free to:   
+1. [read the docs](https://williamfalcon.github.io/pytorch-lightning/).     
+2. [Search through the issues](https://github.com/williamFalcon/pytorch-lightning/issues?utf8=%E2%9C%93&q=my++question).      
+3. [Ask on stackoverflow](https://stackoverflow.com/questions/ask?guided=false) with the tag pytorch-lightning.   
+
+If no one replies to you quickly enough, feel free to post the stackoverflow link to our Gitter chat!   
+
+To chat with the rest of us visit our [gitter channel](https://gitter.im/PyTorch-Lightning/community?utm_source=share-link&utm_medium=link&utm_campaign=share-link)!     
 
 ---   
 ## FAQ    
